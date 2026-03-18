@@ -313,8 +313,8 @@ def render_preview(item: dict, geom_geojson: dict, preview_choice: str):
 
 
 def init_state():
-    if "items" not in st.session_state:
-        st.session_state.items = []
+    if "scene_items" not in st.session_state:
+        st.session_state["scene_items"] = []
     if "aoi_geojson" not in st.session_state:
         st.session_state.aoi_geojson = None
 
@@ -346,14 +346,14 @@ if search_clicked:
         st.warning("Start date must be earlier than end date.")
     else:
         with st.spinner("Searching Sentinel-2 scenes..."):
-            st.session_state.items = search_scenes(
+            st.session_state["scene_items"] = search_scenes(
                 json.dumps(st.session_state.aoi_geojson),
                 start_date.isoformat(),
                 end_date.isoformat(),
                 max_cloud,
             )
 
-items = st.session_state.items
+items = st.session_state["scene_items"]
 
 a, b = st.columns([1.2, 1])
 with a:
