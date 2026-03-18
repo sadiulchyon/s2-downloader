@@ -5,6 +5,7 @@ import json
 import zipfile
 from datetime import date
 from typing import Dict, List, Tuple
+from xml.etree import ElementTree as ET
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,7 +17,7 @@ from pystac_client import Client
 from rasterio.features import geometry_mask
 from rasterio.mask import mask
 from rasterio.warp import Resampling, reproject
-from shapely.geometry import mapping, shape
+from shapely.geometry import MultiPolygon, Polygon, mapping, shape
 from shapely.ops import unary_union, transform as shapely_transform
 
 st.set_page_config(page_title="S2 Explorer", page_icon="🛰️", layout="wide")
@@ -52,22 +53,83 @@ def _safe_divide(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out.astype("float32")
 
 
-def parse_geojson(uploaded_file) -> dict:
-    payload = json.loads(uploaded_file.getvalue().decode("utf-8"))
-    if payload.get("type") == "FeatureCollection":
-        geoms = [shape(feat["geometry"]) for feat in payload.get("features", []) if feat.get("geometry")]
-        if not geoms:
-            raise ValueError("No valid geometry found in the uploaded GeoJSON.")
-        merged = unary_union(geoms)
-    elif payload.get("type") == "Feature":
-        merged = shape(payload["geometry"])
-    else:
-        merged = shape(payload)
-
+def _merge_shapes(geoms: List):
+    if not geoms:
+        raise ValueError("No valid geometry found in the uploaded AOI file.")
+    merged = unary_union(geoms)
     if merged.is_empty:
         raise ValueError("Uploaded geometry is empty.")
-
     return mapping(merged)
+
+
+def parse_geojson_bytes(raw_bytes: bytes) -> dict:
+    payload = json.loads(raw_bytes.decode("utf-8"))
+    if payload.get("type") == "FeatureCollection":
+        geoms = [shape(feat["geometry"]) for feat in payload.get("features", []) if feat.get("geometry")]
+        return _merge_shapes(geoms)
+    if payload.get("type") == "Feature":
+        return _merge_shapes([shape(payload["geometry"])])
+    return _merge_shapes([shape(payload)])
+
+
+def _parse_kml_coords(text: str) -> List[Tuple[float, float]]:
+    coords = []
+    for token in text.replace("\n", " ").replace("\t", " ").split():
+        parts = token.split(",")
+        if len(parts) < 2:
+            continue
+        lon = float(parts[0])
+        lat = float(parts[1])
+        coords.append((lon, lat))
+    return coords
+
+
+def parse_kml_bytes(raw_bytes: bytes) -> dict:
+    root = ET.fromstring(raw_bytes)
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
+    polygons = []
+
+    for poly in root.findall(".//kml:Polygon", ns):
+        outer_el = poly.find(".//kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns)
+        if outer_el is None or not (outer_el.text or "").strip():
+            continue
+        shell = _parse_kml_coords(outer_el.text or "")
+        if len(shell) < 4:
+            continue
+
+        holes = []
+        for inner_el in poly.findall(".//kml:innerBoundaryIs/kml:LinearRing/kml:coordinates", ns):
+            inner_coords = _parse_kml_coords(inner_el.text or "")
+            if len(inner_coords) >= 4:
+                holes.append(inner_coords)
+
+        polygon = Polygon(shell=shell, holes=holes)
+        if not polygon.is_empty:
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if isinstance(polygon, Polygon):
+                polygons.append(polygon)
+            elif isinstance(polygon, MultiPolygon):
+                polygons.extend(list(polygon.geoms))
+
+    if not polygons:
+        raise ValueError("No polygon geometry found in the uploaded KML. Use a polygon AOI in EPSG:4326 coordinates.")
+
+    return _merge_shapes(polygons)
+
+
+def parse_uploaded_aoi(uploaded_file) -> dict:
+    raw_bytes = uploaded_file.getvalue()
+    name = (uploaded_file.name or "").lower()
+    if name.endswith(".kml"):
+        return parse_kml_bytes(raw_bytes)
+    if name.endswith(".geojson") or name.endswith(".json"):
+        return parse_geojson_bytes(raw_bytes)
+
+    try:
+        return parse_geojson_bytes(raw_bytes)
+    except Exception:
+        return parse_kml_bytes(raw_bytes)
 
 
 def reproject_geom(geom_geojson: dict, dst_crs) -> dict:
@@ -368,7 +430,7 @@ st.caption("Phase 1 MVP: upload AOI, search scenes, preview mosaicked dates, and
 
 with st.sidebar:
     st.header("Inputs")
-    uploaded = st.file_uploader("AOI GeoJSON", type=["geojson", "json"])
+    uploaded = st.file_uploader("AOI file", type=["geojson", "json", "kml"], help="Supported formats: GeoJSON, JSON, KML")
     start_date = st.date_input("Start date", value=date(2024, 1, 1))
     end_date = st.date_input("End date", value=date.today())
     max_cloud = st.slider("Max cloud cover (%)", min_value=0, max_value=100, value=20, step=5)
@@ -376,14 +438,14 @@ with st.sidebar:
 
 if uploaded is not None:
     try:
-        st.session_state.aoi_geojson = parse_geojson(uploaded)
+        st.session_state.aoi_geojson = parse_uploaded_aoi(uploaded)
     except Exception as exc:
         st.error(f"AOI could not be read: {exc}")
         st.stop()
 
 if search_clicked:
     if st.session_state.aoi_geojson is None:
-        st.warning("Upload a GeoJSON AOI first.")
+        st.warning("Upload a GeoJSON or KML AOI first.")
     elif start_date > end_date:
         st.warning("Start date must be earlier than end date.")
     else:
@@ -458,7 +520,7 @@ else:
 with st.expander("Current limitations"):
     st.markdown(
         """
-        - This phase 1 app accepts GeoJSON only.
+        - This phase 1 app accepts GeoJSON, JSON, and polygon KML files.
         - Dates are mosaicked from all matching Sentinel-2 scenes returned for that date.
         - Exports are native Sentinel-2 bands, indices, and simple composites.
         - SEN2SR and S2DR3 are intentionally excluded from phase 1 hosting.
